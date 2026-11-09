@@ -93,6 +93,7 @@ out=$(hook SubagentStart '{"session_id":"s1","agent_id":"a2"}')
 check "SubagentStart warns when throttled" 'echo "$out" | grep -q "queue heavy work"' "$out"
 
 echo "queueing"
+fake 99 50 1
 start=$(date +%s)
 out=$(LOADGUARD_QUEUE_WAIT=4 hook PreToolUse '{"session_id":"s1","tool_name":"Bash","tool_use_id":"q1","tool_input":{"command":"docker compose up -d"}}')
 el=$(( $(date +%s) - start ))
@@ -144,6 +145,95 @@ sleep 0.5
 check "background child of wrapped command was killed" '! kill -0 "$(cat "$LOADGUARD_HOME/child")" 2>/dev/null'
 "$LG" run -- bash -c 'exit 7'; rc=$?
 check "run preserves exit code" '[ $rc -eq 7 ]'
+
+echo "monitor"
+rm -f "$LOADGUARD_HOME/state/metrics"
+LOADGUARD_NO_MONITOR=0 LOADGUARD_SAMPLE_SECONDS=1 "$LG" monitor >/dev/null 2>&1 &
+mon=$!
+for i in $(seq 1 20); do grep -qs '^source=monitor' "$LOADGUARD_HOME/state/metrics" && break; sleep 0.5; done
+check "monitor writes live metrics" 'grep -qs "^source=monitor" "$LOADGUARD_HOME/state/metrics"'
+check "monitor records its pid" '[ "$(cat "$LOADGUARD_HOME/state/monitor.pid" 2>/dev/null)" = "$mon" ]'
+kill -TERM "$mon" 2>/dev/null
+for i in $(seq 1 10); do kill -0 "$mon" 2>/dev/null || break; sleep 0.3; done
+check "monitor stops on SIGTERM" '! kill -0 "$mon" 2>/dev/null'
+check "monitor leaves no iostat behind" '! pgrep -P "$mon" >/dev/null 2>&1 && [ ! -f "$LOADGUARD_HOME/state/monitor.pid" ]'
+kill -KILL "$mon" 2>/dev/null; wait "$mon" 2>/dev/null
+
+echo "throttled runs heavy work one at a time"
+fake 95 50 1; rm -f "$LOADGUARD_HOME"/slots/*
+start=$(date +%s)
+out=$(LOADGUARD_QUEUE_WAIT=20 hook PreToolUse '{"session_id":"t1","tool_name":"Bash","tool_use_id":"s1","tool_input":{"command":"npm test"}}')
+el=$(( $(date +%s) - start ))
+check "throttled + empty queue -> runs immediately" '[ $el -le 1 ] && [ -f "$LOADGUARD_HOME/slots/s1" ]' "$out (elapsed $el)"
+out=$(LOADGUARD_QUEUE_WAIT=0 hook PreToolUse '{"session_id":"t2","tool_name":"Bash","tool_use_id":"s2","tool_input":{"command":"npm test"}}')
+check "throttled + one running -> next one is held" 'echo "$out" | grep -q "\"deny\""' "$out"
+rm -f "$LOADGUARD_HOME"/slots/*
+
+echo "simultaneous heavy starts cannot exceed the cap"
+fake 75 50 1; . "$LOADGUARD_HOME/capacity"
+for i in $(seq 1 $(( heavy_slots + 6 ))); do
+  ( LOADGUARD_QUEUE_WAIT=0 hook PreToolUse '{"session_id":"h","agent_id":"a'$i'","tool_name":"Bash","tool_use_id":"h'$i'","tool_input":{"command":"npm test"}}' >/dev/null ) &
+done; wait
+n=$(ls "$LOADGUARD_HOME"/slots | wc -l | tr -d ' ')
+check "burst of $(( heavy_slots + 6 )) gets exactly $heavy_slots slots (got $n)" '[ "$n" -eq "$heavy_slots" ]'
+rm -f "$LOADGUARD_HOME"/slots/*
+fake 30 60 1
+for i in $(seq 1 $(( heavy_slots * 2 ))); do echo "$$ $(date +%s)" > "$LOADGUARD_HOME/slots/fill$i"; done
+out=$(LOADGUARD_QUEUE_WAIT=0 hook PreToolUse '{"session_id":"h2","tool_name":"Bash","tool_use_id":"h20","tool_input":{"command":"npm test"}}')
+check "idle burst is capped at twice the slots" 'echo "$out" | grep -q "\"deny\""' "$out"
+rm -f "$LOADGUARD_HOME"/slots/*
+
+echo "auto-approval is a security boundary"
+fake 30 60 1
+approve() { jq -cn --arg c "$1" '{session_id:"sec",tool_name:"Bash",tool_use_id:"sec",tool_input:{command:$c}}' | "$LG" hook PreToolUse | grep -q '"allow"'; }
+for c in 'loadguard status' 'loadguard status --json' 'loadguard procs' 'loadguard tree' 'loadguard locks' 'loadguard doctor' 'loadguard lock browser "ws://127.0.0.1:9222"' 'loadguard unlock browser' "$ROOT/bin/loadguard status"; do
+  check "approved: $c" 'approve "$c"'
+done
+for c in $'loadguard status\nrm -rf x' $'loadguard status\rrm x' $'loadguard status\trm' './loadguard status' '/tmp/evil/loadguard status' '../x/loadguard procs' 'loadguard status; rm x' 'loadguard status && rm x' 'loadguard status | sh' 'loadguard status > f' 'loadguard status (rm x)' 'loadguard lock a "$(rm x)"' 'loadguard lock a `rm x`' "loadguard lock a 'x'" 'loadguard lock a \\' 'loadguard status --evil' 'loadguard run -- rm x' 'loadguard hook Stop' 'loadguard monitor' 'FOO=1 loadguard status' 'xloadguard status'; do
+  check "NOT approved: $(printf '%q' "$c")" '! approve "$c"'
+done
+
+jqless=$(mktemp -d); for t in cat grep sed awk ps sysctl date dirname uname mkdir rm mv tr head find wc id sleep; do ln -s "$(PATH=/usr/bin:/bin:/usr/sbin:/sbin command -v $t)" "$jqless/$t"; done
+out=$(printf '%s' '{"session_id":"sec","tool_name":"Bash","tool_use_id":"sec","tool_input":{"command":"loadguard status"}}' | PATH="$jqless" /bin/bash "$LG" hook PreToolUse)
+check "without jq, nothing is auto-approved" '! echo "$out" | grep -q "\"allow\""' "$out"
+rm -rf "$jqless"
+
+echo "heavy detection reads commands, not arguments"
+heavy() { rm -f "$LOADGUARD_HOME"/slots/hv; jq -cn --arg c "$1" '{session_id:"hv",tool_name:"Bash",tool_use_id:"hv",tool_input:{command:$c}}' | "$LG" hook PreToolUse >/dev/null; [ -f "$LOADGUARD_HOME/slots/hv" ]; }
+for c in 'npm test' 'make -j8' 'docker compose up -d' 'docker build .' 'cd a && pnpm build' 'FOO=1 pytest -x' 'cargo build' 'npx playwright test' './gradlew build' 'node --test' 'python3 -m pytest' 'bun test' 'time make' 'timeout 60 npm test' 'ls && go test ./...' '(cargo test)' $'cd a\nnpm test'; do
+  check "heavy: $c" 'heavy "$c"'
+done
+for c in 'ls ninja' 'cat webpack.config.js' 'echo docker compose up' 'rg tsc src' 'git commit -m "make tests faster"' 'grep -r "npm test" .' 'npm view react' 'docker ps' 'go version' 'git log --grep=make'; do
+  check "light: $c" '! heavy "$c"'
+done
+rm -f "$LOADGUARD_HOME"/slots/*
+
+echo "sampler to notice, end to end (fake iostat, real monitor and hook)"
+shim=$(mktemp -d); cat > "$shim/iostat" <<'SH'
+#!/bin/bash
+echo "      cpu    load average"; echo " us sy id   1m   5m   15m"
+while :; do echo " 90  8  2  1.00 1.00 1.00"; sleep 0.3; done
+SH
+chmod +x "$shim/iostat"; rm -f "$LOADGUARD_HOME/state/metrics" "$LOADGUARD_HOME/state/episode"
+PATH="$shim:$PATH" LOADGUARD_SAMPLE_SECONDS=1 "$LG" monitor >/dev/null 2>&1 &
+mon=$!
+for i in $(seq 1 30); do grep -qs '^level=severe' "$LOADGUARD_HOME/state/metrics" && break; sleep 0.2; done
+check "98% busy from iostat classifies as severe" 'grep -qs "^level=severe" "$LOADGUARD_HOME/state/metrics"' "$(cat "$LOADGUARD_HOME/state/metrics" 2>/dev/null)"
+out=$(hook PostToolUse '{"session_id":"live","tool_name":"Read","tool_use_id":"l1"}')
+check "live monitor reading reaches the agent mid-run" 'valid_json "$out" && echo "$out" | grep -q "throttling"' "$out"
+kill -TERM "$mon" 2>/dev/null; for i in $(seq 1 10); do kill -0 "$mon" 2>/dev/null || break; sleep 0.3; done
+kill -KILL "$mon" 2>/dev/null; wait "$mon" 2>/dev/null; rm -rf "$shim"; rm -f "$LOADGUARD_HOME/state/episode"
+
+echo "session detection"
+fakebin=$(mktemp -d); mkdir -p "$fakebin/@anthropic-ai/claude-code"
+cat > "$fakebin/@anthropic-ai/claude-code/cli.js" <<SH
+#!/bin/bash
+"$LG" lock npmtest "x" >/dev/null; "$LG" locks > "$fakebin/out.tmp"; mv "$fakebin/out.tmp" "$fakebin/out"; sleep 1
+SH
+chmod +x "$fakebin/@anthropic-ai/claude-code/cli.js"; "$fakebin/@anthropic-ai/claude-code/cli.js" & npmpid=$!
+for i in $(seq 1 50); do [ -s "$fakebin/out" ] && break; sleep 0.1; done
+check "npm-installed Claude Code is recognised as the session" 'grep -q "session $npmpid" "$fakebin/out"' "$(cat "$fakebin/out" 2>/dev/null) expected $npmpid"
+wait $npmpid; rm -rf "$fakebin"; "$LG" unlock npmtest >/dev/null
 
 echo "misc"
 check "procs runs" '"$LG" procs --no-docker | head -1 | grep -q PID'

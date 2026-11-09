@@ -7,7 +7,7 @@ description: Plan and run work so it stays effective on this Mac's CPU and memor
 
 Goal: **get the work done fast without taking the machine down.** It is about effective agents, not frugal ones. If the machine has room, use it: parallelise and add workers. Hold back only when loadguard reports throttling.
 
-`loadguard` is put on PATH at session start. If it is not found, use the absolute path from the session-start note. Its read-only commands are pre-approved.
+`loadguard` is put on PATH at session start. If it is not found, use the absolute path from the session-start note. Its status and coordination commands skip the permission prompt only when run on their own, so don't chain or redirect them.
 
 | Command | What it tells you |
 |---|---|
@@ -36,7 +36,7 @@ Do these three things, then carry on with the task:
 
 1. **Dead processes.** If the notice includes a candidate list, ask the user **once**, in a single multi-select question, which to kill, then kill only those (`kill <pid>`, and `kill -9` only if it survives). Don't ask again in the same episode, and don't kill anything you weren't given. If no list was included, skip this step.
 2. **Consolidate.** Run `loadguard tree`. Stop duplicates you own. Before starting a browser, docker stack or dev server, run `loadguard lock <name> "<how to connect>"`. If it is held, connect to the noted endpoint instead of starting another. Release it with `loadguard unlock <name>` when done.
-3. **Queue.** Run heavy commands one at a time. The Bash hook already holds heavy commands until a slot frees, for up to 60 s. Run fewer heavy subagents at once and start the rest as earlier ones finish. Long jobs can go to the background so they don't hit the Bash timeout.
+3. **Queue.** Run heavy commands one at a time. While throttled, the Bash hook lets one run and holds the rest for up to 60 s. Run fewer heavy subagents at once and start the rest as earlier ones finish. Long jobs can go to the background so they don't hit the Bash timeout.
 
 ## When the machine is idle
 

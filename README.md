@@ -19,7 +19,7 @@ or inside Claude Code:
 /plugin install loadguard@vectorise-loadguard
 ```
 
-The plugin installs at user scope, so it applies to every project. The first session scans the machine (cores, P/E split, RAM, swap) and writes `~/.loadguard/capacity`. Its read-only commands (`loadguard status|procs|tree|locks|lock|unlock`) are approved automatically. You don't need to edit any settings.
+The plugin installs at user scope, so it applies to every project. The first session scans the machine (cores, P/E split, RAM, swap) and writes `~/.loadguard/capacity`. Its own commands (`loadguard status|procs|tree|locks|doctor|scan|lock|unlock`) skip the permission prompt, but only as a single simple command run by name or from the plugin's own path. Anything chained, redirected or multi-line, or another binary called `loadguard`, goes through your normal permissions. If `jq` is missing, nothing is auto-approved. You don't need to edit any settings.
 
 ## What it does
 
@@ -27,7 +27,7 @@ The plugin installs at user scope, so it applies to every project. The first ses
 |---|---|
 | Session start | Starts a background sampler and tells Claude the machine's capacity and current headroom. On an idle machine that means: parallelise, use `-j<cores>`. |
 | Every plan, workflow or subagent spawn (`ExitPlanMode`, `Agent`, `Task`, `Workflow`) | Adds a one-line budget: how many concurrent heavy jobs fit right now, and to share browsers, docker and dev servers. |
-| Heavy Bash command (builds, test suites, `docker compose up`, browsers, installs…) | Takes a heavy-job slot. When the machine is throttling or slots are full, the command **waits in the queue** (up to 60 s) until capacity frees up. If the machine is still saturated after that, the agent gets one deny with a replan instruction. A retry always goes through, so loadguard can't deadlock work. |
+| Heavy Bash command (builds, test suites, `docker compose up`, installs…) | Takes a heavy-job slot. The limit depends on the level: **idle** twice `heavy_slots`, **ok** `heavy_slots`, **throttled** one at a time, **severe** none. Over the limit, the command **waits in the queue** (up to 60 s). If it still can't run, the agent gets one deny with a replan instruction. A retry always goes through once it has waited, so loadguard can't deadlock work. Only the command itself counts, not its arguments, so `cat webpack.config.js` is never held. |
 | Any tool call while throttling | Each agent and subagent is told once, mid-run, to replan: (1) dead processes to clean up, (2) its own footprint to consolidate, (3) heavy work to queue. When pressure clears, each one is told to return to full speed. |
 | Session end | Releases slots and shared-resource locks the session held. The sampler exits once no Claude session has run for 3 minutes. |
 
@@ -35,7 +35,7 @@ The plugin installs at user scope, so it applies to every project. The first ses
 
 1. **Dead processes.** `loadguard procs` finds orphaned dev processes, meaning their parent has exited: node/python/bun, MCP servers, headless Chrome from Playwright or Puppeteer, test runners, and parents of zombies. launchd services, GUI apps and system processes are excluded. A process is never flagged on CPU use alone. Across all sessions, Claude asks you once per episode, in a single multi-select question, which to kill. Nothing is killed without your answer.
 2. **Consolidate.** `loadguard tree` shows CPU and RAM per Claude session, grouped by tool family (browser, docker, dev-server, tests, mcp, node), and flags duplicates. `loadguard lock <name> "<endpoint>"` lets one agent own a shared browser, docker stack or dev server while the others reuse it. Locks release when the owning session dies.
-3. **Queue.** Heavy commands share `heavy_slots` (default: the smaller of cores/2 and RAM/6 GB, minimum 2). Under pressure they run one after another. `loadguard run -- <cmd>` also kills the command's whole process group when it exits, so nothing is left running.
+3. **Queue.** Heavy commands share `heavy_slots` (default: the smaller of cores/2 and RAM/6 GB, minimum 2). Under pressure they run one after another, and slots are claimed atomically so agents starting together can't overshoot. `loadguard run -- <cmd>` also kills the command's whole process group when it exits, so nothing is left running.
 
 ## The rules
 
@@ -47,7 +47,7 @@ Simple on purpose, and all configurable:
 
 **Memory on macOS.** Used RAM always looks near 100% because of caches and compression, so loadguard ignores it. It reads the kernel's own signals: `kern.memorystatus_vm_pressure_level` (normal, warn or critical, the same signal Chromium and Firefox use), `kern.memorystatus_level` (% available, as shown by `memory_pressure`), and the rate of swap-outs from `vm_stat`. Swap that's used but not growing isn't a problem.
 
-**CPU.** The sampler reads whole-system CPU from a single long-lived `iostat` (about 0.1% of a core, versus about 3% for `top`), averaged over 15 s so short spikes don't trigger it. Without the sampler, hooks fall back to a `ps` estimate, which takes about 30 ms. Hooks read a cached file and take about 35 ms each.
+**CPU.** The sampler reads whole-system CPU from a single long-lived `iostat` (about 0.1% of a core, versus about 3% for `top`), averaged over 15 s so short spikes don't trigger it. Without the sampler, hooks fall back to a `ps` estimate, which is cheap but tends to read low. A `PostToolUse` hook takes about 25 ms (median), 33 ms at p95, measured on an M-series Mac.
 
 ## Configure
 
@@ -79,7 +79,8 @@ loadguard doctor            self-check
 
 ## Compatibility
 
-- macOS 12+ (Apple silicon and Intel). On other OSes the hooks stay inert.
+- Tested on macOS 26 on Apple silicon. It relies only on long-standing macOS tools, but older versions and Intel Macs are untested. On other OSes the hooks stay inert.
+- Tested against Claude Code's native install. npm installs are recognised by command path, which is covered by a simulated test only.
 - Bash 3.2 (the system bash). `jq` is optional.
 - Doesn't depend on any other plugin or service. It works alongside other reapers (such as cc-reaper) and offload tools: anything that runs heavy work remotely simply never shows up as local load.
 - State lives in `~/.loadguard/` (override with `LOADGUARD_HOME`).
@@ -87,7 +88,7 @@ loadguard doctor            self-check
 ## Develop
 
 ```bash
-tests/test.sh                 # 45 checks, isolated state, fake metrics
+tests/test.sh                 # isolated state, fake metrics
 claude --plugin-dir .         # try it in a session
 claude plugin validate .
 ```

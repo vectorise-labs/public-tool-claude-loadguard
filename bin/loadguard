@@ -19,7 +19,7 @@
 #   doctor                 self-check
 set -u
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 LG_HOME="${LOADGUARD_HOME:-$HOME/.loadguard}"
 STATE="$LG_HOME/state"
 mkdir -p "$STATE" "$LG_HOME/slots" "$LG_HOME/locks" "$LG_HOME/notices" 2>/dev/null
@@ -173,7 +173,7 @@ slots_in_use() {
   for f in "$LG_HOME"/slots/*; do
     [ -f "$f" ] || continue
     read -r owner ts <"$f" 2>/dev/null
-    if ! pid_alive "$owner" || [ $(( $(now) - ${ts:-0} )) -gt 7200 ]; then rm -f "$f"; continue; fi
+    if ! pid_alive "$owner" || [ $(( $(now) - ${ts:-0} )) -gt 1800 ]; then rm -f "$f"; continue; fi
     n=$(( n + 1 ))
   done
   echo $n
@@ -198,9 +198,16 @@ cmd_status() {
 
 # --------------------------------------------------------------- monitor ----
 monitor_running() { local p; p=$(cat "$STATE/monitor.pid" 2>/dev/null); pid_alive "$p" && ps -o command= -p "$p" 2>/dev/null | grep -q "loadguard.*monitor"; }
+version_num() { echo "$1" | awk -F. '{printf "%d", $1*1000000+$2*1000+$3}'; }
 ensure_monitor() {
   [ "$NO_MONITOR" = 1 ] && return 0
-  monitor_running && return 0
+  if monitor_running; then
+    [ "$(version_num "$(cat "$STATE/monitor.version" 2>/dev/null || echo 0.0.0)")" -ge "$(version_num "$VERSION")" ] && return 0
+    local old; old=$(cat "$STATE/monitor.pid" 2>/dev/null)
+    pkill -P "$old" 2>/dev/null; kill -TERM "$old" 2>/dev/null; sleep 0.2
+    pid_alive "$old" && kill -KILL "$old" 2>/dev/null
+    rm -f "$STATE/monitor.pid"
+  fi
   nohup "$0" monitor >/dev/null 2>&1 </dev/null &
   disown 2>/dev/null || true
 }
@@ -210,10 +217,14 @@ cmd_monitor() {
   is_mac || { echo "loadguard monitor: macOS only" >&2; return 1; }
   monitor_running && return 0
   echo $$ | atomic_write "$STATE/monitor.pid"
+  echo "$VERSION" | atomic_write "$STATE/monitor.version"
   renice -n 15 -p $$ >/dev/null 2>&1   # never compete with real work
   load_capacity
   local hist="" prev_so="" prev_t="" idle_since=""
-  trap 'rm -f "$STATE/monitor.pid"; pkill -P $$ iostat 2>/dev/null; exit 0' TERM INT
+  # The pipeline runs in the background and we `wait` on it: bash defers traps
+  # while a foreground pipeline runs, so a foreground `iostat | while` would make
+  # the monitor ignore SIGTERM forever.
+  trap 'rm -f "$STATE/monitor.pid"; pkill -P $$ 2>/dev/null; exit 0' TERM INT HUP
   # One long-lived `iostat` gives true whole-system CPU every SAMPLE_SECONDS at
   # near-zero cost (`top` costs ~3% of a core). Its first row is the since-boot
   # average, so it is skipped.
@@ -245,16 +256,18 @@ cmd_monitor() {
       [ -z "$idle_since" ] && idle_since=$t
       [ $(( t - idle_since )) -ge 180 ] && break
     fi
-  done
+  done &
+  wait $!
+  pkill -P $$ iostat 2>/dev/null
   rm -f "$STATE/monitor.pid"
 }
 
 # ----------------------------------------------------------- processes -----
 # Walk up from a pid to the nearest `claude` ancestor (the session process).
 claude_ancestor() {
-  ps -A -o pid=,ppid=,comm= 2>/dev/null | awk -v start="${1:-$$}" '
-    { pp[$1]=$2; c=$3; for(i=4;i<=NF;i++) c=c" "$i; n=split(c,a,"/"); cm[$1]=a[n] }
-    END { p=start; for(k=0;k<64 && p>1;k++){ if (cm[p]=="claude"){print p; exit} p=pp[p] } }'
+  ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v start="${1:-$$}" '
+    { pp[$1]=$2; n=split($3,a,"/"); is[$1]=(a[n]=="claude" || $0 ~ /@anthropic-ai\/claude-code|claude-code\/cli/) }
+    END { p=start; for(k=0;k<64 && p>1;k++){ if (is[p]){print p; exit} p=pp[p] } }'
 }
 
 # Dead-process candidates: orphaned (parent gone, PPID 1) dev-tool processes or
@@ -307,7 +320,7 @@ cmd_tree() {
       return "other"
     }
     { pid=$1; pp[pid]=$2; cp[pid]=$3; rs[pid]=$4; c=""; for(i=5;i<=NF;i++) c=c (i>5?" ":"") $i; cmd[pid]=c
-      n=split($5,a,"/"); if (a[n]=="claude") sess[pid]=1 }
+      n=split($5,a,"/"); if (a[n]=="claude" || c ~ /@anthropic-ai\/claude-code|claude-code\/cli/) sess[pid]=1 }
     END {
       for (p in cmd) { q=pp[p]; s=""; for(k=0;k<64 && q>1;k++){ if (q in sess){s=q;break} q=pp[q] }
         if (s=="") continue
@@ -350,13 +363,37 @@ cmd_locks() {
 # -------------------------------------------------------------------- run ---
 # Wait for a heavy slot (bounded), run the command in its own process group,
 # and kill anything it leaves behind when it exits.
+# Concurrent heavy jobs allowed at each level. Idle gets a burst above the scanned
+# figure (use the machine) but stays capped, because the sampler lags by ~15 s and
+# twenty builds started together look idle until they've already saturated it.
+# Throttled runs strictly one at a time: queued, not stopped. Severe waits.
+slot_cap() {
+  case "$level" in
+    idle) echo $(( heavy_slots * 2 ));;
+    ok) echo "$heavy_slots";;
+    throttled) echo 1;;
+    *) echo 0;;
+  esac
+}
+slot_lock() {
+  local l="$LG_HOME/slots.lock" i=0
+  find "$l" -maxdepth 0 -mtime +10s -exec rmdir {} \; 2>/dev/null
+  while ! mkdir "$l" 2>/dev/null; do
+    i=$(( i + 1 )); [ "$i" -ge 40 ] && return 1
+    sleep 0.05
+  done
+}
 acquire_slot() {  # $1=id $2=owner pid $3=max wait seconds
   local id="$1" owner="$2" max="$3" waited=0
   while :; do
     sample
-    local used; used=$(slots_in_use)
-    if [ "$level" = idle ] || { [ "$level" != severe ] && [ "$level" != throttled ] && [ "$used" -lt "$heavy_slots" ]; }; then
-      echo "$owner $(now)" | atomic_write "$LG_HOME/slots/$id"; echo $waited; return 0
+    if slot_lock; then
+      if [ "$(slots_in_use)" -lt "$(slot_cap)" ]; then
+        echo "$owner $(now)" | atomic_write "$LG_HOME/slots/$id"
+        rmdir "$LG_HOME/slots.lock" 2>/dev/null
+        echo $waited; return 0
+      fi
+      rmdir "$LG_HOME/slots.lock" 2>/dev/null
     fi
     [ "$waited" -ge "$max" ] && { echo $waited; return 1; }
     sleep 3; waited=$(( waited + 3 ))
@@ -380,12 +417,46 @@ cmd_run() {
 }
 
 # ------------------------------------------------------------------- hooks --
-HEAVY_REGEX='(^|[;&|(`[:space:]])(docker(-compose| compose)? +(up|build|run|compose +up)|docker-compose +(up|build)|(npm|pnpm|yarn|bun) +(run +)?(build|test|e2e|ci|install|i)( |$)|npx +(playwright|jest|vitest|next +build|tsc|webpack|cypress)|playwright +test|cypress +run|(^|[[:space:]/])(jest|vitest|pytest|tox|nox)( |$)|cargo +(build|test|bench|clippy)|go +(build|test)|(^|[[:space:]])make( |$)|gradlew?|mvnw?( |$)|xcodebuild|swift +(build|test)|tsc( |$)|webpack|next +build|vite +build|turbo +(run|build|test)|nx +(run|build|test|affected)|bazel|cmake +--build|ninja|terraform +(plan|apply)|ffmpeg|pip +install|uv +(sync|pip +install)|poetry +install|brew +(install|upgrade)|localstack|minikube|kind +create|k3d|ollama +run)'
+# Matched against the head of each simple command, never against arguments, so
+# `cat webpack.config.js` or `git commit -m "make it faster"` are not heavy.
+HEAVY_HEADS='docker +(compose +(up|build|run)|build|buildx|run)|docker-compose +(up|build|run)|(npm|pnpm|yarn|bun) +(run +)?(build|test|e2e|ci|install|i)|(npx|bunx|pnpm +exec) +(playwright|jest|vitest|next +build|tsc|webpack|cypress)|playwright +test|cypress +run|jest|vitest|pytest|tox|nox|python[0-9.]* +-m +(pytest|tox|unittest)|uv +run +pytest|node +--test|cargo +(build|test|bench|clippy)|go +(build|test)|g?make|gradlew?|mvnw?|xcodebuild|swift +(build|test)|tsc|webpack|next +build|vite +build|turbo +(run|build|test)|nx +(run|build|test|affected)|bazel|cmake +--build|ninja|terraform +(plan|apply)|ffmpeg|pip3? +install|uv +(sync|pip +install)|poetry +install|brew +(install|upgrade)|localstack|minikube|kind +create|k3d|ollama +run'
+
+is_heavy() {
+  [ -n "$HEAVY_EXTRA_REGEX" ] && printf '%s' "$1" | grep -Eq "$HEAVY_EXTRA_REGEX" && return 0
+  printf '%s\n' "$1" | awk '{ gsub(/\047[^\047]*\047/,""); gsub(/"[^"]*"/,""); gsub(/&&|\|\||[;|&()`]/,"\n"); print }' \
+    | sed -E 's/^[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|sudo|time|nice|exec|env|command|caffeinate|g?timeout[[:space:]]+[0-9.]+[a-z]?)[[:space:]]+)*//' \
+    | grep -Eq "^([^[:space:]]*/)?($HEAVY_HEADS)([[:space:]]|\$)"
+}
+
+# Auto-approval is a security boundary: this decides what skips the user's
+# permission prompt. Allow exactly one simple loadguard invocation, by bare name
+# or by this plugin's own path (never another binary that is merely called
+# loadguard), with a strict character allow-list and only a parsed input.
+own_cli_prefix() {
+  local c="$1"; c="${c#"${c%%[![:space:]]*}"}"
+  case "$c" in
+    "loadguard "*) printf '%s' "${c#loadguard }";;
+    "$LG_BIN_DIR/loadguard "*) printf '%s' "${c#"$LG_BIN_DIR"/loadguard }";;
+    *) return 1;;
+  esac
+}
+is_own_safe_command() {
+  [ "${parsed:-0}" = 1 ] || return 1
+  local rest; rest=$(own_cli_prefix "$1") || return 1
+  case "$1" in *[!A-Za-z0-9_./:@=,+\ \"-]*) return 1;; esac
+  case "$rest" in
+    status|"status --json"|scan|procs|"procs --no-docker"|tree|locks|doctor|version) return 0;;
+    "lock "*|"unlock "*) return 0;;
+  esac
+  return 1
+}
+is_own_run_command() { local r; r=$(own_cli_prefix "$1") || return 1; case "$r" in "run "*) return 0;; esac; return 1; }
 
 json_get() {  # json_get <json> -> sets session_id agent_id tool_name tool_use_id command source
   if command -v jq >/dev/null 2>&1; then
-    local out; out=$(printf '%s' "$1" | jq -r '[.session_id//"", .agent_id//"", .tool_name//"", .tool_use_id//"", (.tool_input.command//""|gsub("[\t\n]";" ")), .source//"", (.tool_input.run_in_background//false|tostring)] | join("\u001f")' 2>/dev/null)
+    local out; out=$(printf '%s' "$1" | jq -r '[.session_id//"", .agent_id//"", .tool_name//"", .tool_use_id//"", (.tool_input.command//""|gsub("[\r\n]";";")|gsub("\t";" ")), .source//"", (.tool_input.run_in_background//false|tostring)] | join("\u001f")' 2>/dev/null)
     IFS=$'\x1f' read -r session_id agent_id tool_name tool_use_id command source bg <<<"$out"
+    parsed=1
   else
     j() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
     session_id=$(j "$1" session_id); agent_id=$(j "$1" agent_id); tool_name=$(j "$1" tool_name)
@@ -449,7 +520,7 @@ hook() {
   [ "$DISABLE" = 1 ] && exit 0
   is_mac || exit 0
   local ev="${1:-}" input; input=$(cat 2>/dev/null)
-  local session_id="" agent_id="" tool_name="" tool_use_id="" command="" source="" bg=false
+  local session_id="" agent_id="" tool_name="" tool_use_id="" command="" source="" bg=false parsed=0
   json_get "$input"
   local who="${session_id}${agent_id:+-$agent_id}"
   case "$ev" in
@@ -473,16 +544,16 @@ hook() {
       sample
       case "$tool_name" in
         Bash)
-          # Let loadguard's own read-only/coordination commands through without a prompt.
-          if printf '%s' "$command" | grep -Eq '^[[:space:]]*([^[:space:]]*/)?loadguard (status|scan|procs|tree|lock|unlock|locks|doctor)([[:space:]]|$)' \
-             && ! printf '%s' "$command" | grep -q '[;&|`$<>]'; then
-            emit_decision allow "loadguard read-only command"; exit 0
+          if is_own_safe_command "$command"; then
+            emit_decision allow "loadguard status or coordination command"; exit 0
           fi
-          printf '%s' "$command" | grep -Eq "^[[:space:]]*([^[:space:]]*/)?loadguard run" && exit 0
-          if printf '%s' "$command" | grep -Eq "$HEAVY_REGEX${HEAVY_EXTRA_REGEX:+|$HEAVY_EXTRA_REGEX}"; then
+          is_own_run_command "$command" && exit 0
+          if is_heavy "$command"; then
             local owner; owner=$(claude_ancestor $$); owner=${owner:-$PPID}
             local waited
-            if waited=$(acquire_slot "${tool_use_id:-pre-$$}" "$owner" "$QUEUE_WAIT"); then
+            # Stay inside the hook's 90 s timeout whatever QUEUE_WAIT is set to.
+            local maxwait=$QUEUE_WAIT; [ "$maxwait" -gt 85 ] && maxwait=85
+            if waited=$(acquire_slot "${tool_use_id:-pre-$$}" "$owner" "$maxwait"); then
               [ "${waited:-0}" -gt 0 ] && emit_context PreToolUse "loadguard: this heavy command waited ${waited}s in the queue for capacity. $(status_line)"
               # Background commands keep running after PostToolUse; release the slot as the
               # command's lifetime is unknown (live metrics still gate the next one).
@@ -519,7 +590,7 @@ hook() {
       local owner; owner=$(claude_ancestor $$)
       # release slots whose owner session is gone (and ours, at session end)
       local f o; for f in "$LG_HOME"/slots/*; do [ -f "$f" ] || continue; read -r o _ <"$f"
-        { ! pid_alive "$o" || { [ "$ev" = SessionEnd ] && [ "$o" = "$owner" ]; }; } && rm -f "$f"; done
+        { ! pid_alive "$o" || { [ "$o" = "$owner" ] && { [ "$ev" = SessionEnd ] || { [ "$ev" = Stop ] && [ -z "$agent_id" ]; }; }; }; } && rm -f "$f"; done
       if [ "$ev" = SessionEnd ]; then for f in "$LG_HOME"/locks/*; do [ -f "$f" ] || continue
         o=$(sed -n 's/^owner=//p' "$f"); [ "$o" = "$owner" ] && rm -f "$f"; done; fi ;;
   esac

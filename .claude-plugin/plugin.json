@@ -1,7 +1,7 @@
 {
   "name": "loadguard",
   "displayName": "loadguard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Keeps Claude Code effective on macOS: watches CPU, memory pressure, swap and thermals, queues heavy jobs under pressure, tells running agents (mid-run) how to replan, finds dead processes to clean up, and pushes agents to use more of the machine when it is idle.",
   "author": { "name": "Vectorise Labs", "url": "https://github.com/vectorise-labs" },
   "homepage": "https://github.com/vectorise-labs/public-tool-claude-loadguard",
