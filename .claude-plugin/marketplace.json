@@ -1,0 +1,13 @@
+{
+  "name": "vectorise-loadguard",
+  "owner": { "name": "Vectorise Labs", "url": "https://github.com/vectorise-labs" },
+  "metadata": { "description": "loadguard: resource-aware agents for Claude Code on macOS" },
+  "plugins": [
+    {
+      "name": "loadguard",
+      "source": "./",
+      "description": "Resource-aware agents on macOS: queue heavy work under CPU/memory pressure, replan mid-run, clean up dead processes, use spare capacity.",
+      "category": "productivity"
+    }
+  ]
+}

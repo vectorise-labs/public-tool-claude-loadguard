@@ -1,0 +1,555 @@
+#!/bin/bash
+# loadguard: keep Claude Code agents effective on a Mac by watching CPU,
+# memory pressure, swap and thermals, queueing heavy work under pressure and
+# telling agents (mid-run) how to replan. Bash 3.2 compatible, no dependencies
+# beyond macOS built-ins (jq is used when present, with a fallback).
+#
+# Usage: loadguard <command> [args]
+#   status [--json]        current level and metrics (one line, or JSON)
+#   scan                   (re)measure machine capacity and write the profile
+#   procs                  list likely-dead processes worth killing (never kills)
+#   tree                   resource use per Claude session and duplicated tools
+#   lock <name> [note]     claim a shared resource (chrome, docker, dev-server…)
+#   unlock <name>          release a resource you claimed
+#   locks                  list shared resources and their owners/notes
+#   run [--] <cmd…>        run a heavy command through the queue, cleaning up its
+#                          process group afterwards
+#   monitor                background sampler (started automatically)
+#   hook <Event>           Claude Code hook entry point (reads JSON on stdin)
+#   doctor                 self-check
+set -u
+
+VERSION="0.1.0"
+LG_HOME="${LOADGUARD_HOME:-$HOME/.loadguard}"
+STATE="$LG_HOME/state"
+mkdir -p "$STATE" "$LG_HOME/slots" "$LG_HOME/locks" "$LG_HOME/notices" 2>/dev/null
+
+# ---------------------------------------------------------------- config ----
+# Defaults. Override in ~/.loadguard/config (KEY=VALUE lines) or the environment.
+CPU_THROTTLE=90        # % whole-system CPU (sustained) that counts as throttling
+CPU_SEVERE=97
+LOAD_RATIO_THROTTLE=3  # 1-min load / cores; with CPU >= 80 also counts as throttling
+MEM_FREE_THROTTLE=20   # kern.memorystatus_level (% memory available to the OS)
+MEM_FREE_SEVERE=10
+SWAPOUT_THROTTLE=200   # pages/s swapped out (active thrashing; needs the monitor)
+IDLE_CPU=45            # below this (and memory healthy) agents should parallelise more
+SAMPLE_SECONDS=5
+QUEUE_WAIT=60          # max seconds a heavy command waits in the queue (hook)
+HEAVY_SLOTS=""         # empty = computed by `scan`
+HEAVY_EXTRA_REGEX=""   # extra ERE matched against Bash commands to mark them heavy
+NO_MONITOR=0           # 1 = never start the background sampler (hooks fall back to on-demand samples)
+DISABLE=0
+[ -f "$LG_HOME/config" ] && . "$LG_HOME/config"
+for v in CPU_THROTTLE CPU_SEVERE LOAD_RATIO_THROTTLE MEM_FREE_THROTTLE MEM_FREE_SEVERE \
+         SWAPOUT_THROTTLE IDLE_CPU SAMPLE_SECONDS QUEUE_WAIT HEAVY_SLOTS HEAVY_EXTRA_REGEX NO_MONITOR DISABLE; do
+  eval "ev=\${LOADGUARD_$v:-}"; [ -n "$ev" ] && eval "$v=\$ev"
+done
+
+now() { date +%s; }
+atomic_write() { local f="$1" t; t="$f.$$.tmp"; cat >"$t" && mv -f "$t" "$f"; }
+pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+is_mac() { [ "$(uname -s)" = Darwin ]; }
+
+# --------------------------------------------------------------- capacity ---
+scan() {
+  local ncpu pcores ecores mem_b mem_gb swap_total model slots
+  ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+  pcores=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo "$ncpu")
+  ecores=$(sysctl -n hw.perflevel1.physicalcpu 2>/dev/null || echo 0)
+  mem_b=$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)
+  mem_gb=$(( mem_b / 1073741824 ))
+  model=$(sysctl -n hw.model 2>/dev/null || echo unknown)
+  swap_total=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $3}')
+  # Concurrent heavy jobs (builds, test suites, containers, browsers): roughly one
+  # per two cores and one per 6 GB of RAM, whichever is smaller, at least 2.
+  slots=$(( ncpu / 2 )); [ $(( mem_gb / 6 )) -lt "$slots" ] && slots=$(( mem_gb / 6 ))
+  [ "$slots" -lt 2 ] && slots=2
+  atomic_write "$LG_HOME/capacity" <<EOF
+scanned_at=$(now)
+version=$VERSION
+model=$model
+arch=$(uname -m)
+os=$(sw_vers -productVersion 2>/dev/null || uname -r)
+ncpu=$ncpu
+pcores=$pcores
+ecores=$ecores
+mem_gb=$mem_gb
+swap_total=$swap_total
+heavy_slots=$slots
+EOF
+}
+load_capacity() {
+  [ -f "$LG_HOME/capacity" ] || scan
+  . "$LG_HOME/capacity"
+  [ -n "$HEAVY_SLOTS" ] && heavy_slots=$HEAVY_SLOTS
+}
+
+# ---------------------------------------------------------------- sample ----
+# Produces: cpu load_ratio mem_free pressure swap_used_mb swapout_rate thermal level reasons
+classify() {
+  level=ok; reasons=""
+  local lr10; lr10=$(awk -v l="$load_ratio" 'BEGIN{printf "%d", l*10}')
+  add() { reasons="${reasons:+$reasons, }$1"; }
+  if [ "$cpu" -ge "$CPU_SEVERE" ] || [ "$pressure" -ge 4 ] || [ "$mem_free" -le "$MEM_FREE_SEVERE" ]; then
+    level=severe
+  elif [ "$cpu" -ge "$CPU_THROTTLE" ] || [ "$pressure" -ge 2 ] || [ "$mem_free" -le "$MEM_FREE_THROTTLE" ] \
+       || { [ "$cpu" -ge 80 ] && [ "$lr10" -ge $(( LOAD_RATIO_THROTTLE * 10 )) ]; } \
+       || [ "${swapout_rate:-0}" -ge "$SWAPOUT_THROTTLE" ] || [ "${thermal:-100}" -lt 100 ]; then
+    level=throttled
+  elif [ "$cpu" -lt "$IDLE_CPU" ] && [ "$pressure" -le 1 ] && [ "$mem_free" -gt 40 ]; then
+    level=idle
+  fi
+  [ "$cpu" -ge "$CPU_THROTTLE" ] && add "CPU ${cpu}%"
+  [ "$cpu" -ge 80 ] && [ "$lr10" -ge $(( LOAD_RATIO_THROTTLE * 10 )) ] && add "run queue ${load_ratio}x cores"
+  [ "$pressure" -ge 4 ] && add "memory pressure CRITICAL"
+  [ "$pressure" -eq 2 ] && add "memory pressure warn"
+  [ "$mem_free" -le "$MEM_FREE_THROTTLE" ] && add "only ${mem_free}% memory available"
+  [ "${swapout_rate:-0}" -ge "$SWAPOUT_THROTTLE" ] && add "swapping ${swapout_rate} pages/s"
+  [ "${thermal:-100}" -lt 100 ] && add "thermal limit ${thermal}%"
+  return 0
+}
+
+cold_sample() {
+  load_capacity
+  local ps_sum load1
+  ps_sum=$(ps -A -o %cpu= 2>/dev/null | awk '{s+=$1} END{printf "%d", s}')
+  cpu=$(( ps_sum / ncpu )); [ "$cpu" -gt 100 ] && cpu=100
+  load1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+  load_ratio=$(awk -v l="${load1:-0}" -v n="$ncpu" 'BEGIN{printf "%.1f", l/n}')
+  mem_free=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo 100)
+  pressure=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
+  swap_used_mb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{gsub("M","",$6); printf "%d", $6}')
+  swapout_rate=0; thermal=100; source=cold
+}
+
+write_metrics() {
+  atomic_write "$STATE/metrics" <<EOF
+ts=$(now)
+source=$source
+cpu=$cpu
+load_ratio=$load_ratio
+mem_free=$mem_free
+pressure=$pressure
+swap_used_mb=${swap_used_mb:-0}
+swapout_rate=${swapout_rate:-0}
+thermal=${thermal:-100}
+level=$level
+reasons="$reasons"
+EOF
+}
+
+# Episode = a continuous stretch of throttling (with 60 s hysteresis). Notices
+# and the one-time kill prompt are de-duplicated per episode.
+update_episode() {
+  local ef="$STATE/episode" t; t=$(now)
+  episode=""; [ -f "$ef" ] && episode=$(sed -n 1p "$ef")
+  if [ "$level" = throttled ] || [ "$level" = severe ]; then
+    [ -z "$episode" ] && episode=$t
+    printf '%s\n%s\n' "$episode" "$t" | atomic_write "$ef"
+  elif [ -n "$episode" ]; then
+    local last; last=$(sed -n 2p "$ef")
+    if [ $(( t - ${last:-0} )) -ge 60 ]; then
+      rm -f "$ef"; echo "$episode" | atomic_write "$STATE/last_episode"; episode=""
+    fi
+  fi
+}
+
+# sample: prefer fresh monitor data, else a cached or new cold sample.
+sample() {
+  load_capacity
+  local m="$STATE/metrics" t; t=$(now)
+  if [ -f "$m" ]; then
+    . "$m"
+    local age=$(( t - ${ts:-0} ))
+    if { [ "$source" = monitor ] && [ "$age" -le $(( SAMPLE_SECONDS * 3 )) ]; } || [ "$age" -le 3 ]; then
+      classify; update_episode; return 0
+    fi
+  fi
+  cold_sample; classify; write_metrics; update_episode
+}
+
+slots_in_use() {
+  local n=0 f owner ts
+  for f in "$LG_HOME"/slots/*; do
+    [ -f "$f" ] || continue
+    read -r owner ts <"$f" 2>/dev/null
+    if ! pid_alive "$owner" || [ $(( $(now) - ${ts:-0} )) -gt 7200 ]; then rm -f "$f"; continue; fi
+    n=$(( n + 1 ))
+  done
+  echo $n
+}
+
+pressure_name() { if [ "$pressure" = 1 ]; then echo normal; elif [ "$pressure" = 2 ]; then echo warn; elif [ "$pressure" = 4 ]; then echo critical; else echo "$pressure"; fi; }
+status_line() {
+  local used; used=$(slots_in_use)
+  echo "loadguard: ${level} | CPU ${cpu}% (load ${load_ratio}x/${ncpu} cores) | memory available ${mem_free}%, pressure $(pressure_name), swap ${swap_used_mb}MB | heavy slots ${used}/${heavy_slots}${reasons:+ | $reasons}"
+}
+
+cmd_status() {
+  sample
+  if [ "${1:-}" = "--json" ]; then
+    printf '{"level":"%s","cpu":%s,"load_ratio":%s,"mem_free":%s,"pressure":%s,"swap_used_mb":%s,"swapout_rate":%s,"thermal":%s,"heavy_slots":%s,"slots_in_use":%s,"ncpu":%s,"mem_gb":%s,"reasons":"%s","episode":"%s"}\n' \
+      "$level" "$cpu" "$load_ratio" "$mem_free" "$pressure" "${swap_used_mb:-0}" "${swapout_rate:-0}" "${thermal:-100}" \
+      "$heavy_slots" "$(slots_in_use)" "$ncpu" "$mem_gb" "$reasons" "$episode"
+  else
+    status_line
+  fi
+}
+
+# --------------------------------------------------------------- monitor ----
+monitor_running() { local p; p=$(cat "$STATE/monitor.pid" 2>/dev/null); pid_alive "$p" && ps -o command= -p "$p" 2>/dev/null | grep -q "loadguard.*monitor"; }
+ensure_monitor() {
+  [ "$NO_MONITOR" = 1 ] && return 0
+  monitor_running && return 0
+  nohup "$0" monitor >/dev/null 2>&1 </dev/null &
+  disown 2>/dev/null || true
+}
+claude_alive() { pgrep -qx claude 2>/dev/null || pgrep -qf 'claude-code|@anthropic-ai/claude' 2>/dev/null; }
+
+cmd_monitor() {
+  is_mac || { echo "loadguard monitor: macOS only" >&2; return 1; }
+  monitor_running && return 0
+  echo $$ | atomic_write "$STATE/monitor.pid"
+  renice -n 15 -p $$ >/dev/null 2>&1   # never compete with real work
+  load_capacity
+  local hist="" prev_so="" prev_t="" idle_since=""
+  trap 'rm -f "$STATE/monitor.pid"; pkill -P $$ iostat 2>/dev/null; exit 0' TERM INT
+  # One long-lived `iostat` gives true whole-system CPU every SAMPLE_SECONDS at
+  # near-zero cost (`top` costs ~3% of a core). Its first row is the since-boot
+  # average, so it is skipped.
+  local first=1
+  iostat -n 0 -w "$SAMPLE_SECONDS" 2>/dev/null | while read -r us sy id _rest; do
+    case "$us" in ''|*[!0-9]*) continue;; esac
+    [ "$first" = 1 ] && { first=0; continue; }
+    local inst t so
+    inst=$(( 100 - id ))
+    hist="$(echo "$hist $inst" | awk '{for(i=NF-2;i<=NF;i++) if(i>0) printf "%s ", $i}')"
+    cpu=$(echo "$hist" | awk '{s=0;for(i=1;i<=NF;i++)s+=$i; printf "%d", s/NF}')   # ~15 s average
+    t=$(now)
+    so=$(vm_stat 2>/dev/null | awk '/Swapouts/ {gsub("\\.","",$2); print $2}')
+    swapout_rate=0
+    [ -n "$prev_so" ] && [ "$t" -gt "$prev_t" ] && swapout_rate=$(( (so - prev_so) / (t - prev_t) ))
+    [ "$swapout_rate" -lt 0 ] && swapout_rate=0
+    prev_so=$so; prev_t=$t
+    local load1; load1=$(sysctl -n vm.loadavg | awk '{print $2}')
+    load_ratio=$(awk -v l="$load1" -v n="$ncpu" 'BEGIN{printf "%.1f", l/n}')
+    mem_free=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo 100)
+    pressure=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
+    swap_used_mb=$(sysctl -n vm.swapusage | awk '{gsub("M","",$6); printf "%d", $6}')
+    thermal=$(pmset -g therm 2>/dev/null | awk -F= '/CPU_Speed_Limit/ {gsub(/ /,"",$2); print $2}')
+    thermal=${thermal:-100}
+    source=monitor
+    classify; write_metrics; update_episode
+    # Exit once no Claude Code process has existed for 3 minutes.
+    if claude_alive; then idle_since=""; else
+      [ -z "$idle_since" ] && idle_since=$t
+      [ $(( t - idle_since )) -ge 180 ] && break
+    fi
+  done
+  rm -f "$STATE/monitor.pid"
+}
+
+# ----------------------------------------------------------- processes -----
+# Walk up from a pid to the nearest `claude` ancestor (the session process).
+claude_ancestor() {
+  ps -A -o pid=,ppid=,comm= 2>/dev/null | awk -v start="${1:-$$}" '
+    { pp[$1]=$2; c=$3; for(i=4;i<=NF;i++) c=c" "$i; n=split(c,a,"/"); cm[$1]=a[n] }
+    END { p=start; for(k=0;k<64 && p>1;k++){ if (cm[p]=="claude"){print p; exit} p=pp[p] } }'
+}
+
+# Dead-process candidates: orphaned (parent gone, PPID 1) dev-tool processes or
+# processes whose Claude session has exited. Never CPU alone. Never kills.
+cmd_procs() {
+  local me_session; me_session=$(claude_ancestor $$)
+  echo "PID     CPU%   MEM_MB  AGE          WHY                      COMMAND"
+  # launchd-managed services (LaunchAgents) legitimately have PPID 1: never flag them.
+  local managed; managed=" $(launchctl list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')"
+  ps -A -o pid=,ppid=,user=,%cpu=,rss=,etime=,stat=,command= 2>/dev/null | awk -v user="$(id -un)" -v me="$$" -v sess="${me_session:-0}" -v managed="$managed" '
+    BEGIN {
+      dev = "(^|/)(node|bun|deno|python[0-9.]*|uv|ruby|java|esbuild|vite|webpack|next-server|tsserver|turbo|jest|vitest|playwright|chromedriver|geckodriver|chrome-headless-shell|npm|npx|pnpm|yarn|uvicorn|gunicorn|celery|docker-compose|mcp[-_a-z]*|[a-z-]*-mcp[-a-z]*)( |$)"
+      headless = "(--headless|--remote-debugging-port|playwright|puppeteer|chrome-headless-shell|ms-playwright)"
+      protect = "(/Applications/|/System/|/usr/libexec/|/Library/Apple/|loadguard|\\.vscode|Code Helper|Cursor Helper)"
+    }
+    {
+      pid=$1; ppid=$2; u=$3; cpu=$4; rss=$5; et=$6; st=$7; cmd=""
+      for(i=8;i<=NF;i++) cmd=cmd (i>8?" ":"") $i
+      if (st ~ /^Z/) { zomb[ppid]++; next }
+      if (u != user || pid == me || pid == sess || index(managed, " " pid " ")) next
+      why=""
+      if (ppid == 1 && cmd ~ headless && cmd !~ /Google Chrome\.app\/Contents\/MacOS\/Google Chrome( |$)/) why="orphaned headless browser"
+      else if (ppid == 1 && cmd !~ protect && (cmd ~ dev || cmd ~ /mcp/)) why="orphaned dev process"
+      if (why == "") next
+      mb = int(rss/1024)
+      if (cpu < 1 && mb < 50) next                     # harmless leftovers
+      printf "%-7s %-6s %-7s %-12s %-24s %s\n", pid, cpu, mb, et, why, substr(cmd,1,110)
+    }
+    END { for (p in zomb) if (zomb[p] >= 3) printf "%-7s %-6s %-7s %-12s %-24s %s\n", p, "-", "-", "-", "parent of " zomb[p] " zombies", "(kill/restart the parent to reap them)" }
+  '
+  if [ "${1:-}" != "--no-docker" ] && command -v docker >/dev/null 2>&1; then
+    local d; d=$( (docker ps --format '{{.ID}}  {{.Names}}  {{.Status}}' 2>/dev/null & p=$!; sleep 3; kill $p 2>/dev/null) 2>/dev/null)
+    [ -n "$d" ] && { echo; echo "Running docker containers (stop ones no agent is using):"; echo "$d" | sed 's/^/  /'; }
+  fi
+}
+
+# Per Claude session: summed CPU/RSS of descendants, grouped by tool family, and
+# duplicated heavy tools that could be shared.
+cmd_tree() {
+  local mine; mine=$(claude_ancestor $$)
+  ps -A -o pid=,ppid=,%cpu=,rss=,command= 2>/dev/null | awk -v mine="${mine:-0}" '
+    function fam(c) {
+      if (c ~ /(--headless|--remote-debugging-port|playwright|puppeteer|chrome-headless-shell|chromium)/) return "browser"
+      if (c ~ /(docker|com\.docker|colima|podman|qemu)/) return "docker"
+      if (c ~ /(vite|next dev|next-server|webpack.*serve|npm run dev|pnpm dev|yarn dev|uvicorn|flask run|rails s)/) return "dev-server"
+      if (c ~ /(jest|vitest|pytest|playwright test|cargo test|go test)/) return "tests"
+      if (c ~ /mcp/) return "mcp"
+      if (c ~ /(^|\/)(node|bun|deno)( |$)/) return "node"
+      if (c ~ /python/) return "python"
+      return "other"
+    }
+    { pid=$1; pp[pid]=$2; cp[pid]=$3; rs[pid]=$4; c=""; for(i=5;i<=NF;i++) c=c (i>5?" ":"") $i; cmd[pid]=c
+      n=split($5,a,"/"); if (a[n]=="claude") sess[pid]=1 }
+    END {
+      for (p in cmd) { q=pp[p]; s=""; for(k=0;k<64 && q>1;k++){ if (q in sess){s=q;break} q=pp[q] }
+        if (s=="") continue
+        f=fam(cmd[p]); key=s SUBSEP f; C[key]+=cp[p]; M[key]+=rs[p]; N[key]++; T[s]+=cp[p]; R[s]+=rs[p]; FAM[f]=1
+        if (f=="browser" && cmd[p] !~ /--type=/) B[s]++ ; if (f=="dev-server") D[s]++ }
+      for (s in sess) {
+        printf "claude session %s%s: CPU %.0f%%, RAM %d MB (claude itself: CPU %.0f%%, %d MB)\n", s, (s==mine?" (this session)":""), T[s]+cp[s], (R[s]+rs[s])/1024, cp[s], rs[s]/1024
+        for (f in FAM) { key=s SUBSEP f; if (N[key]>0) printf "    %-10s %3d procs  CPU %5.0f%%  RAM %6d MB\n", f, N[key], C[key], M[key]/1024 }
+        tb+=B[s]; td+=D[s]
+      }
+      if (tb>1) printf "\n%d separate browser instances across sessions: share one (loadguard lock browser \"CDP ws://...\").\n", tb
+      if (td>1) printf "%d dev servers across sessions: share one per project (loadguard lock dev-server:<project> \"http://localhost:PORT\").\n", td
+    }'
+}
+
+# ------------------------------------------------------------------ locks ---
+cmd_lock() {
+  local name="${1:?usage: loadguard lock <name> [note]}"; shift; local note="$*"
+  local f="$LG_HOME/locks/$(echo "$name" | tr '/ ' '__')" owner
+  owner=$(claude_ancestor $$); owner=${owner:-$PPID}
+  if [ -f "$f" ]; then
+    local o; o=$(sed -n 's/^owner=//p' "$f")
+    if pid_alive "$o" && [ "$o" != "$owner" ]; then
+      echo "HELD by claude session $o since $(sed -n 's/^since=//p' "$f"). Reuse it instead of starting another:"
+      sed -n 's/^note=/  /p' "$f"; return 3
+    fi
+  fi
+  printf 'owner=%s\nsince=%s\nnote=%s\n' "$owner" "$(date '+%H:%M:%S')" "$note" | atomic_write "$f"
+  echo "OK: you own '$name'. Others will be told to reuse it.${note:+ Note: $note}"
+}
+cmd_unlock() { rm -f "$LG_HOME/locks/$(echo "${1:?usage: loadguard unlock <name>}" | tr '/ ' '__')"; echo "released ${1}"; }
+cmd_locks() {
+  local f o any=0
+  for f in "$LG_HOME"/locks/*; do [ -f "$f" ] || continue
+    o=$(sed -n 's/^owner=//p' "$f"); pid_alive "$o" || { rm -f "$f"; continue; }
+    any=1; echo "$(basename "$f"): session $o since $(sed -n 's/^since=//p' "$f") $(sed -n 's/^note=//p' "$f")"
+  done; [ $any = 1 ] || echo "no shared resources claimed"
+}
+
+# -------------------------------------------------------------------- run ---
+# Wait for a heavy slot (bounded), run the command in its own process group,
+# and kill anything it leaves behind when it exits.
+acquire_slot() {  # $1=id $2=owner pid $3=max wait seconds
+  local id="$1" owner="$2" max="$3" waited=0
+  while :; do
+    sample
+    local used; used=$(slots_in_use)
+    if [ "$level" = idle ] || { [ "$level" != severe ] && [ "$level" != throttled ] && [ "$used" -lt "$heavy_slots" ]; }; then
+      echo "$owner $(now)" | atomic_write "$LG_HOME/slots/$id"; echo $waited; return 0
+    fi
+    [ "$waited" -ge "$max" ] && { echo $waited; return 1; }
+    sleep 3; waited=$(( waited + 3 ))
+  done
+}
+cmd_run() {
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || { echo "usage: loadguard run -- <command...>" >&2; return 2; }
+  local id="run-$$" owner; owner=$(claude_ancestor $$); owner=${owner:-$$}
+  if ! acquire_slot "$id" "$owner" "${QUEUE_WAIT}" >/dev/null; then
+    status_line >&2; echo "loadguard: still throttled after ${QUEUE_WAIT}s in queue; running anyway (effectiveness first)." >&2
+    echo "$owner $(now)" | atomic_write "$LG_HOME/slots/$id"
+  fi
+  set -m 2>/dev/null
+  "$@" & local child=$!
+  trap 'kill -TERM -- -$child 2>/dev/null' INT TERM
+  wait $child; local rc=$?
+  kill -TERM -- -"$child" 2>/dev/null; sleep 0.2; kill -KILL -- -"$child" 2>/dev/null
+  rm -f "$LG_HOME/slots/$id"
+  return $rc
+}
+
+# ------------------------------------------------------------------- hooks --
+HEAVY_REGEX='(^|[;&|(`[:space:]])(docker(-compose| compose)? +(up|build|run|compose +up)|docker-compose +(up|build)|(npm|pnpm|yarn|bun) +(run +)?(build|test|e2e|ci|install|i)( |$)|npx +(playwright|jest|vitest|next +build|tsc|webpack|cypress)|playwright +test|cypress +run|(^|[[:space:]/])(jest|vitest|pytest|tox|nox)( |$)|cargo +(build|test|bench|clippy)|go +(build|test)|(^|[[:space:]])make( |$)|gradlew?|mvnw?( |$)|xcodebuild|swift +(build|test)|tsc( |$)|webpack|next +build|vite +build|turbo +(run|build|test)|nx +(run|build|test|affected)|bazel|cmake +--build|ninja|terraform +(plan|apply)|ffmpeg|pip +install|uv +(sync|pip +install)|poetry +install|brew +(install|upgrade)|localstack|minikube|kind +create|k3d|ollama +run)'
+
+json_get() {  # json_get <json> -> sets session_id agent_id tool_name tool_use_id command source
+  if command -v jq >/dev/null 2>&1; then
+    local out; out=$(printf '%s' "$1" | jq -r '[.session_id//"", .agent_id//"", .tool_name//"", .tool_use_id//"", (.tool_input.command//""|gsub("[\t\n]";" ")), .source//"", (.tool_input.run_in_background//false|tostring)] | join("\u001f")' 2>/dev/null)
+    IFS=$'\x1f' read -r session_id agent_id tool_name tool_use_id command source bg <<<"$out"
+  else
+    j() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+    session_id=$(j "$1" session_id); agent_id=$(j "$1" agent_id); tool_name=$(j "$1" tool_name)
+    tool_use_id=$(j "$1" tool_use_id); command=$(j "$1" command); source=$(j "$1" source); bg=false
+  fi
+}
+json_str() { printf '%s' "$1" | awk 'BEGIN{ORS=""} {gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t"); if (NR>1) print "\\n"; print}'; }
+emit_context() {  # $1=event $2=text
+  printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$1" "$(json_str "$2")"
+}
+emit_decision() {  # $1=allow|deny $2=reason
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"%s","permissionDecisionReason":"%s"}}\n' "$1" "$(json_str "$2")"
+}
+once() {  # once <key>: true the first time per episode (atomic across sessions)
+  local d="$LG_HOME/notices/${episode:-none}"; mkdir -p "$d" 2>/dev/null
+  mkdir "$d/$1" 2>/dev/null
+}
+gc_notices() { find "$LG_HOME/notices" -mindepth 1 -maxdepth 1 -type d -mmin +720 -exec rm -rf {} + 2>/dev/null; }
+
+playbook() {
+  local who="${1:-session}" kill_list=""
+  if once "kill-prompt"; then
+    kill_list=$(cmd_procs --no-docker 2>/dev/null)
+    if [ "$(echo "$kill_list" | wc -l | tr -d ' ')" -le 1 ]; then kill_list=""; fi
+  fi
+  cat <<EOF
+$(status_line)
+The machine is throttling. Keep the work moving, but replan how it runs:
+1. Dead processes:$( [ -n "$kill_list" ] && printf ' these look abandoned (orphaned, parent exited). Ask the user ONCE, in a single multi-select question, which to kill; kill only what they pick; do not ask again this episode.\n%s' "$kill_list" || echo ' none flagged (or another session is already handling the one-time cleanup prompt). Do not ask the user about it.')
+2. Consolidate your own footprint: run \`loadguard tree\`. Reuse instead of duplicating: one browser, one docker stack, one dev server per project. Claim shared things with \`loadguard lock <name> "<how to reach it>"\`; if a lock is held, connect to the noted endpoint instead of starting another. Stop what you started and no longer need.
+3. Queue heavy work: don't start several builds, test suites, containers or browsers at once. Run them one after another (loadguard holds heavy Bash commands in a queue automatically), spawn fewer parallel subagents until this clears, and clean up what each one starts.
+Don't slow down light work (reads, edits, searches) or stop the task. This is about getting it done, not doing less.
+EOF
+}
+
+LG_BIN_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# Make `loadguard` callable from the Bash tool. CLAUDE_ENV_FILE (SessionStart
+# only) persists env for the session's Bash commands; otherwise tell the agent
+# the absolute path.
+expose_cli() {
+  if [ -n "${CLAUDE_ENV_FILE:-}" ] && ! grep -qs "$LG_BIN_DIR" "$CLAUDE_ENV_FILE"; then
+    printf 'export PATH="%s:$PATH"\n' "$LG_BIN_DIR" >> "$CLAUDE_ENV_FILE" 2>/dev/null
+  fi
+}
+lg_cmd() {
+  if [ -n "${CLAUDE_ENV_FILE:-}" ] || [ "$(command -v loadguard 2>/dev/null)" = "$LG_BIN_DIR/loadguard" ]; then echo loadguard
+  else echo "$LG_BIN_DIR/loadguard"; fi
+}
+
+capacity_brief() {
+  local lg; lg=$(lg_cmd)
+  [ "$lg" != loadguard ] && echo "loadguard CLI: $lg (use this path wherever these notes say \`loadguard\`)."
+  echo "loadguard: this Mac has ${ncpu} cores (${pcores}P+${ecores}E), ${mem_gb} GB RAM, ${heavy_slots} concurrent heavy-job slots (builds, test suites, containers, browsers). $(status_line | sed 's/^loadguard: /now: /')"
+  case "$level" in
+    idle|ok) echo "There is spare capacity. Be effective: run independent work in parallel, use the cores you have (e.g. make -j${ncpu}, test runners with workers), and don't serialize out of caution. Share heavy tools (one browser, one docker stack, one dev server per project) via \`loadguard lock <name> \"<endpoint>\"\`. If loadguard reports throttling later, follow its steps.";;
+    *) playbook;;
+  esac
+}
+
+hook() {
+  [ "$DISABLE" = 1 ] && exit 0
+  is_mac || exit 0
+  local ev="${1:-}" input; input=$(cat 2>/dev/null)
+  local session_id="" agent_id="" tool_name="" tool_use_id="" command="" source="" bg=false
+  json_get "$input"
+  local who="${session_id}${agent_id:+-$agent_id}"
+  case "$ev" in
+    SessionStart)
+      [ -f "$LG_HOME/capacity" ] || scan
+      expose_cli; ensure_monitor; gc_notices; sample
+      emit_context SessionStart "$(capacity_brief)" ;;
+    SubagentStart)
+      sample
+      if [ "$level" = throttled ] || [ "$level" = severe ]; then
+        emit_context SubagentStart "$(status_line). The machine is throttling: queue heavy work (builds, tests, containers, browsers) one at a time, reuse resources other agents have already started (see \`loadguard locks\`), and clean up anything you start before you finish."
+      else
+        emit_context SubagentStart "$(status_line). There is capacity; work at full speed. Reuse shared heavy tools (\`loadguard locks\`) and clean up whatever you start before you finish."
+      fi ;;
+    UserPromptSubmit)
+      ensure_monitor; sample
+      if { [ "$level" = throttled ] || [ "$level" = severe ]; } && once "prompt-$session_id"; then
+        emit_context UserPromptSubmit "$(playbook)"
+      fi ;;
+    PreToolUse)
+      sample
+      case "$tool_name" in
+        Bash)
+          # Let loadguard's own read-only/coordination commands through without a prompt.
+          if printf '%s' "$command" | grep -Eq '^[[:space:]]*([^[:space:]]*/)?loadguard (status|scan|procs|tree|lock|unlock|locks|doctor)([[:space:]]|$)' \
+             && ! printf '%s' "$command" | grep -q '[;&|`$<>]'; then
+            emit_decision allow "loadguard read-only command"; exit 0
+          fi
+          printf '%s' "$command" | grep -Eq "^[[:space:]]*([^[:space:]]*/)?loadguard run" && exit 0
+          if printf '%s' "$command" | grep -Eq "$HEAVY_REGEX${HEAVY_EXTRA_REGEX:+|$HEAVY_EXTRA_REGEX}"; then
+            local owner; owner=$(claude_ancestor $$); owner=${owner:-$PPID}
+            local waited
+            if waited=$(acquire_slot "${tool_use_id:-pre-$$}" "$owner" "$QUEUE_WAIT"); then
+              [ "${waited:-0}" -gt 0 ] && emit_context PreToolUse "loadguard: this heavy command waited ${waited}s in the queue for capacity. $(status_line)"
+              # Background commands keep running after PostToolUse; release the slot as the
+              # command's lifetime is unknown (live metrics still gate the next one).
+              [ "$bg" = true ] && rm -f "$LG_HOME/slots/${tool_use_id:-pre-$$}"
+            else
+              if once "deny-$who"; then
+                emit_decision deny "$(status_line). Queued ${waited}s and the machine is still saturated. Before running this heavy command, replan: finish or stop other heavy jobs you started, reuse running ones (loadguard locks), and run heavy steps one at a time. Retrying is allowed. loadguard won't block the same agent twice in one episode."
+              else
+                echo "$owner $(now)" | atomic_write "$LG_HOME/slots/${tool_use_id:-pre-$$}"
+              fi
+            fi
+          fi ;;
+        Agent|Task|Workflow|ExitPlanMode|TeamCreate)
+          if [ "$level" = throttled ] || [ "$level" = severe ]; then
+            emit_context PreToolUse "$(status_line). Plan for this: run fewer heavy agents at once (about $(( heavy_slots / 2 > 0 ? heavy_slots / 2 : 1 )) concurrent), queue heavy steps, have agents share browsers, docker and dev servers via \`loadguard lock\`, and make each agent clean up what it starts."
+          else
+            emit_context PreToolUse "$(status_line). Plan for this: the machine has room for up to ${heavy_slots} concurrent heavy jobs. Parallelise independent work freely; have agents share browsers, docker and dev servers via \`loadguard lock\`, and make each agent clean up what it starts."
+          fi ;;
+      esac ;;
+    PostToolUse|PostToolUseFailure)
+      [ -n "$tool_use_id" ] && rm -f "$LG_HOME/slots/$tool_use_id" 2>/dev/null
+      sample
+      if [ "$level" = throttled ] || [ "$level" = severe ]; then
+        if once "mid-$who"; then emit_context "$ev" "$(playbook)"
+        elif [ "$level" = severe ] && once "severe-$who"; then emit_context "$ev" "$(status_line). SEVERE: pause new heavy work until this clears."
+        fi
+      elif [ -f "$STATE/last_episode" ]; then
+        local le; le=$(cat "$STATE/last_episode")
+        if [ -d "$LG_HOME/notices/$le/mid-$who" ] && mkdir "$LG_HOME/notices/$le/cleared-$who" 2>/dev/null; then
+          emit_context "$ev" "$(status_line). Pressure has cleared. Return to full speed and normal parallelism."
+        fi
+      fi ;;
+    Stop|SubagentStop|SessionEnd)
+      local owner; owner=$(claude_ancestor $$)
+      # release slots whose owner session is gone (and ours, at session end)
+      local f o; for f in "$LG_HOME"/slots/*; do [ -f "$f" ] || continue; read -r o _ <"$f"
+        { ! pid_alive "$o" || { [ "$ev" = SessionEnd ] && [ "$o" = "$owner" ]; }; } && rm -f "$f"; done
+      if [ "$ev" = SessionEnd ]; then for f in "$LG_HOME"/locks/*; do [ -f "$f" ] || continue
+        o=$(sed -n 's/^owner=//p' "$f"); [ "$o" = "$owner" ] && rm -f "$f"; done; fi ;;
+  esac
+  exit 0
+}
+
+cmd_doctor() {
+  local ok=1
+  is_mac && echo "✓ macOS $(sw_vers -productVersion)" || { echo "✗ not macOS (loadguard is inert elsewhere)"; ok=0; }
+  for c in sysctl vm_stat top ps pgrep pmset; do command -v $c >/dev/null && echo "✓ $c" || { echo "✗ missing $c"; ok=0; }; done
+  command -v jq >/dev/null && echo "✓ jq (optional)" || echo "· jq not found (fallback parser in use)"
+  load_capacity; echo "✓ capacity: ${ncpu} cores, ${mem_gb} GB, ${heavy_slots} heavy slots ($LG_HOME/capacity)"
+  monitor_running && echo "✓ monitor running (pid $(cat "$STATE/monitor.pid"))" || echo "· monitor not running (starts with the next Claude session)"
+  sample; status_line
+  [ $ok = 1 ]
+}
+
+case "${1:-status}" in
+  status)  shift; cmd_status "$@";;
+  scan)    scan; load_capacity; cat "$LG_HOME/capacity";;
+  procs)   shift; cmd_procs "$@";;
+  tree)    cmd_tree;;
+  lock)    shift; cmd_lock "$@";;
+  unlock)  shift; cmd_unlock "$@";;
+  locks)   cmd_locks;;
+  run)     shift; cmd_run "$@";;
+  monitor) cmd_monitor;;
+  hook)    shift; hook "$@";;
+  doctor)  cmd_doctor;;
+  version|--version|-v) echo "loadguard $VERSION";;
+  help|-h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//';;
+  *) echo "unknown command: $1 (try: loadguard help)" >&2; exit 2;;
+esac
