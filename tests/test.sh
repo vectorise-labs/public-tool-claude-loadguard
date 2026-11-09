@@ -150,11 +150,12 @@ check "procs runs" '"$LG" procs --no-docker | head -1 | grep -q PID'
 check "tree runs" '"$LG" tree >/dev/null'
 check "LOADGUARD_DISABLE=1 makes hooks inert" '[ -z "$(LOADGUARD_DISABLE=1 hook SessionStart "{}")" ]'
 fake 95 50 1
-t0=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
-for i in 1 2 3 4 5 6 7 8 9 10; do hook PostToolUse '{"session_id":"perf","tool_name":"Read","tool_use_id":"p'$i'"}' >/dev/null; done
-t1=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
-ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%d", (b-a)*100}')
-check "PostToolUse hook averages < 150ms (got ${ms}ms)" '[ "$ms" -lt 150 ]'
+# Measure CPU time (user+sys), not wall time: on a loaded machine wall time
+# reflects the scheduler, not the hook's own cost.
+hook PostToolUse '{"session_id":"perf","tool_name":"Read","tool_use_id":"p0"}' >/dev/null  # first call emits the playbook
+ms=$( { /usr/bin/time -p bash -c 'for i in 1 2 3 4 5 6 7 8 9 10; do printf "%s" "{\"session_id\":\"perf\",\"tool_name\":\"Read\",\"tool_use_id\":\"p$i\"}" | "$0" hook PostToolUse >/dev/null; done' "$LG"; } 2>&1 >/dev/null \
+  | awk '/^(user|sys)/{s+=$2} END{printf "%d", s*100}')
+check "PostToolUse hook averages < 150ms CPU (got ${ms}ms)" '[ "$ms" -lt 150 ]'
 
 echo; echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -24,7 +24,7 @@ if ! claude plugin install "loadguard@$MARKET" --scope user -y; then
 fi
 
 # Initial capacity scan from the installed copy, so the first session is instant.
-root=$(ls -d "$HOME"/.claude/plugins/cache/"$MARKET"/loadguard/*/ 2>/dev/null | sort -V | tail -1 || true)
+root=$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/"$MARKET"/loadguard/*/ 2>/dev/null | sort -V | tail -1 || true)
 if [ -n "$root" ] && [ -x "$root/bin/loadguard" ]; then
   echo "→ scanning this machine"
   "$root/bin/loadguard" scan | grep -E '^(model|ncpu|pcores|ecores|mem_gb|heavy_slots)=' | sed 's/^/    /'
